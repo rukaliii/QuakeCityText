@@ -17,7 +17,7 @@ namespace QuakeCityText
         /// </summary>
         public static async Task<JObject?> GetLatestEarthquakeAsync()
         {
-            //string url = "https://api.p2pquake.net/v2/jma/quake?limit=1&offset=767";
+            //string url = "https://api.p2pquake.net/v2/jma/quake?limit=1&offset=930";
             string url = "https://api.p2pquake.net/v2/history?codes=551&limit=1";
             try
             {

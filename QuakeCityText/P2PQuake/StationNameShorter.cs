@@ -1,5 +1,7 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -9,17 +11,58 @@ namespace QuakeCityText
 {
     public class StationNameShorter
     {
-        public static readonly Regex ShortenPattern = new(
-            @"^(?:(?:余市町|田村市|玉村町|東村山市|武蔵村山市|羽村市|十日町市|上市町|大町市|名古屋中村区|大阪堺市.+?区|下市町|大村市|野々市市|四日市市|廿日市市|大町町)|.+?村)?(.+?島|.+?[市区町村])",
-            RegexOptions.Compiled
-        );
+        private static Dictionary<string, string> map;
+
+        public static void Initialize(string areaJsonPath)
+        {
+            var list = JsonConvert.DeserializeObject<List<Data1>>(File.ReadAllText(areaJsonPath));
+
+            map = list
+                .GroupBy(x => x.name)
+                .ToDictionary(
+                    g => g.Key,
+                    g => g.First().city.name
+                );
+        }
 
         public static string Shorten(string name)
         {
-            var match = ShortenPattern.Match(name);
-            if (match.Success && match.Groups.Count > 1)
-                return match.Groups[1].Value;
+            if (string.IsNullOrEmpty(name)) return name;
+
+            if (map != null && map.TryGetValue(name, out var city))
+                return city;
+
+            int idx = name.IndexOf("市");
+            if (idx >= 0) return name.Substring(0, idx + 1);
+
+            idx = name.IndexOf("町");
+            if (idx >= 0) return name.Substring(0, idx + 1);
+
+            idx = name.IndexOf("村");
+            if (idx >= 0) return name.Substring(0, idx + 1);
+
             return name;
         }
+    }
+    public class Data1
+    {
+        public Area area { get; set; }
+        public City city { get; set; }
+        public string code { get; set; }
+        public string name { get; set; }
+        public string furigana { get; set; }
+    }
+    public class Area
+    {
+        public string code { get; set; }
+        public string name { get; set; }
+        public string furigana { get; set; }
+    }
+
+    public class City
+    {
+        public string code { get; set; }
+        public string name { get; set; }
+        public string furigana { get; set; }
     }
 }

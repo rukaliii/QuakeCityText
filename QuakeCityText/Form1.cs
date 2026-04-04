@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json.Linq;
+using QuakeCityText.Processor;
 using QuakeCityText.Properties;
 using System;
 using System.Collections.Generic;
@@ -25,13 +26,14 @@ namespace QuakeCityText
         }
 
         EarthquakeWebSocketClient client = new EarthquakeWebSocketClient();
+        private JObject _lastMaxScaleData = null;
         private async void Form1_Load(object sender, EventArgs e)
         {
             byte[] fontBuf1 = Resources.NotoSansJP_VF;
             AddFont(fontBuf1);
 
             LoadShindoColors();
-
+            StationNameShorter.Initialize("points.json");
             var latest = await P2PQuakeClient.GetLatestEarthquakeAsync();
             if (latest != null)
             {
@@ -42,8 +44,28 @@ namespace QuakeCityText
             await client.StartAsync();
             client.OnMessageReceived += (data) =>
             {
-                DisplayMaxScaleRegion(data);
+                if (InvokeRequired)
+                {
+                    BeginInvoke(new Action(() => DisplayMaxScaleRegion(data)));
+                }
+                else
+                {
+                    DisplayMaxScaleRegion(data);
+                }
             };
+
+            {
+                _pageTimer = new System.Windows.Forms.Timer();
+                _pageTimer.Interval = 80;
+                _pageTimer.Tick += (s, e) =>
+                {
+                    if (_lastMaxScaleData != null)
+                    {
+                        DisplayMaxScaleRegion(_lastMaxScaleData);
+                    }
+                };
+                _pageTimer.Start();
+            }
         }
         private unsafe void AddFont(byte[] fontBuffer)
         {
@@ -55,98 +77,52 @@ namespace QuakeCityText
 
 
         public static PrivateFontCollection pfc = new PrivateFontCollection();
+        private System.Windows.Forms.Timer _pageTimer;
+        private ProcessedQuakeData _cachedProcessed;
 
         public void DisplayMaxScaleRegion(JObject data)
         {
-            if (data["code"]?.Value<int>() != 551) return;
+            if (data == null) return;
 
-            var points = data["points"]?.ToObject<JArray>();
-            if (points == null) return;
+            _lastMaxScaleData = data;
 
-            int maxScale = data["earthquake"]?["maxScale"]?.Value<int>() ?? 0;
+            int _lastWidth = -1;
+            bool widthChanged = _lastWidth != pictureBox1.Width;
+            _lastWidth = pictureBox1.Width;
 
-            var maxPoints = points
-                .Where(p => p["scale"]?.Value<int>() == maxScale)
-                .ToList();
-
-            var addrList = maxPoints
-                .Select(p => p["addr"]?.Value<string>())
-                .Where(addr => !string.IsNullOrEmpty(addr))
-                .Select(addr => StationNameShorter.Shorten(addr))
-                .Distinct()
-                .ToList();
-
-            string areaText = string.Join(" ", addrList);
-
-            string formatted = cityintFormat.FormatAreaString(areaText, 13);
-
-            int lineCount = formatted.Split('\n').Length;
-
-            if (lineCount > 7)
+            if (_cachedProcessed == null || widthChanged)
             {
-                var prefList = maxPoints
-                    .Where(p => !string.IsNullOrEmpty(p["pref"]?.Value<string>()))
-                    .GroupBy(p => p["pref"]!.Value<string>())
-                    .Select(g =>
-                    {
-                        var cities = g
-                            .Select(p => p["addr"]?.Value<string>())
-                            .Where(a => !string.IsNullOrEmpty(a))
-                            .Select(a => StationNameShorter.Shorten(a)) // 市町村化
-                            .Distinct()
-                            .Count();
+                var processed = EarthquakeDataProcessor.Process(data);
+                if (processed == null) return;
 
-                        return $"{g.Key.Replace("県", "").Replace("府", "").Replace("東京都", "東京")}({cities})";
-                    })
-                    .ToList();
-
-                areaText = string.Join(" ", prefList);
-
-                formatted = cityintFormat.FormatAreaString(areaText, 13);
-            }
-
-            Bitmap canvasText = new Bitmap(pictureBox1.Width, pictureBox1.Height);
-
-            using (Graphics g = Graphics.FromImage(canvasText))
-            {
-                g.TextRenderingHint = TextRenderingHint.AntiAlias;
-
-                g.DrawString(
-                    $"震度{ShindoScale[maxScale]}",
-                    new Font(pfc.Families[0], 23f, FontStyle.Bold),
-                    Brushes.White,
-                    10f,
-                    0f
-                );
-
-                g.FillRectangle(
-                    new SolidBrush(ShindoColor[maxScale]),
-                    10,
-                    43,
-                    278,
-                    2
-                );
-
-                var lines = formatted
-                    .Replace(" ", "\u3000")
-                    .Replace("　", "  ")
-                    .Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
-
-                using (var font = new Font(pfc.Families[0], 16f, FontStyle.Regular))
+                using (Bitmap tmp = new Bitmap(1, 1))
+                using (Graphics g = Graphics.FromImage(tmp))
+                using (var font = new Font(pfc.Families[0], 16f))
                 {
-                    float x = 10f;
-                    float y = 49f;
-                    float lineSpacing = font.GetHeight(g) - 10f;
+                    float maxWidth = pictureBox1.Width - 20f;
 
-                    foreach (var line in lines)
-                    {
-                        g.DrawString(line, font, Brushes.White, x, y);
-                        y += lineSpacing;
-                    }
+                    string formatted = AreaFormatter.Format(
+                        g,
+                        processed.AreaList,
+                        font,
+                        maxWidth
+                    );
+
+                    processed.FormattedLines = formatted.Split('\n').ToList();
                 }
+
+                _cachedProcessed = processed;
             }
 
-            pictureBox1.Image = canvasText;
+            pictureBox1.Image?.Dispose();
+
+            pictureBox1.Image = QuakeRenderer.Render(
+                pictureBox1.Size,
+                _cachedProcessed,
+                pfc,
+                DateTime.Now,
+                7.5
+            );
         }
 
         private async void Form1_FormClosing(object sender, FormClosingEventArgs e)
@@ -155,26 +131,9 @@ namespace QuakeCityText
         }
 
 
-        public static Dictionary<int, string> ShindoScale = new Dictionary<int, string>
-    {
-        { -1, "なし"},
-        { 10, "1"},
-        { 20, "2"},
-        { 30, "3"},
-        { 40, "4"},
-        { 46, "5弱以上未入電"},
-        { 45, "5弱"},
-        { 50, "5強"},
-        { 55, "6弱"},
-        { 60, "6強"},
-        { 70, "7"},
-    };
 
 
-
-
-
-        // JSON から読み込むため空で初期化。LoadShindoColors() が起動時に埋める。
+        //JSON から読み込むため空で初期化。LoadShindoColors() が起動時に埋める。
         public static Dictionary<int, Color> ShindoColor = new Dictionary<int, Color>();
 
         /// <summary>
@@ -196,13 +155,11 @@ namespace QuakeCityText
                 }
                 else
                 {
-                    // ファイルがない場合は既存のハードコード値をフォールバックとして設定
                     PopulateDefaultShindoColor();
                 }
             }
             catch
             {
-                // 読み込みに失敗したらデフォルトを使用
                 PopulateDefaultShindoColor();
             }
         }
@@ -249,7 +206,6 @@ namespace QuakeCityText
                 ShindoColor[key] = color;
             }
 
-            // 必要なキーが欠けている場合はデフォルト値で補う
             var defaults = GetDefaultShindoColorDictionary();
             foreach (var kv in defaults)
             {
@@ -322,6 +278,11 @@ namespace QuakeCityText
                 { 60, Color.FromArgb(160,0,0)},
                 { 70, Color.FromArgb(100,0,100)},
             };
+        }
+
+        private void Form1_SizeChanged(object sender, EventArgs e)
+        {
+            DisplayMaxScaleRegion(_lastMaxScaleData);
         }
     }
 }
