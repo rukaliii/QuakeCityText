@@ -36,10 +36,12 @@ namespace QuakeCityText
                 {
                     _ws?.Dispose();
                     _ws = new ClientWebSocket();
+                    _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
 
                     await _ws.ConnectAsync(_uri, _cts.Token);
                     Console.WriteLine("WebSocket接続成功");
 
+                    _ = Task.Run(PingLoop);
                     retry = 0;
 
                     await ReceiveLoop();
@@ -59,6 +61,24 @@ namespace QuakeCityText
             }
         }
 
+        private async Task PingLoop()
+        {
+            while (_ws?.State == WebSocketState.Open && !_cts.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    var buffer = Encoding.UTF8.GetBytes("ping");
+                    await _ws.SendAsync(
+                        new ArraySegment<byte>(buffer),
+                        WebSocketMessageType.Text,
+                        true,
+                        _cts.Token);
+                }
+                catch { }
+
+                await Task.Delay(15000, _cts.Token);
+            }
+        }
         private async Task ReceiveLoop()
         {
             var buffer = new byte[8192];
@@ -91,6 +111,12 @@ namespace QuakeCityText
                     try
                     {
                         var json = JObject.Parse(message);
+
+                        int code = json["code"]?.Value<int?>() ?? -1;
+                        if (code != 551)
+                        {
+                            continue;
+                        }
                         OnMessageReceived?.Invoke(json);
                     }
                     catch
