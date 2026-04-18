@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json.Linq;
+using Newtonsoft.Json.Linq;
 using System;
 using System.IO;
 using System.Net.WebSockets;
@@ -8,11 +8,16 @@ using System.Threading.Tasks;
 
 namespace QuakeCityText
 {
-    public class EarthquakeWebSocketClient
+    public class EarthquakeWebSocketClient : IDisposable
     {
         private readonly Uri _uri;
+
         private ClientWebSocket _ws;
-        private readonly CancellationTokenSource _cts = new();
+        private CancellationTokenSource _cts;
+        private Task _mainTask;
+        private readonly object _sync = new();
+
+        private bool _running = false;
 
         public event Action<JObject> OnMessageReceived;
 
@@ -20,36 +25,103 @@ namespace QuakeCityText
         {
             _uri = new Uri(url);
         }
-
-        public async Task StartAsync()
+        public Task StartAsync()
         {
-            _ = Task.Run(MainLoop);
+            lock (_sync)
+            {
+                if (_running)
+                    return Task.CompletedTask;
+
+                _running = true;
+                _cts = new CancellationTokenSource();
+                _mainTask = Task.Run(() => MainLoop(_cts.Token));
+            }
+
+            return Task.CompletedTask;
         }
 
-        private async Task MainLoop()
+        public async Task StopAsync()
+        {
+            Task task = null;
+            ClientWebSocket ws = null;
+
+            lock (_sync)
+            {
+                if (!_running)
+                    return;
+
+                _running = false;
+
+                _cts.Cancel();
+
+                task = _mainTask;
+                ws = _ws;
+            }
+
+            try
+            {
+                if (ws != null &&
+                    (ws.State == WebSocketState.Open ||
+                     ws.State == WebSocketState.CloseReceived))
+                {
+                    await ws.CloseAsync(
+                        WebSocketCloseStatus.NormalClosure,
+                        "close",
+                        CancellationToken.None);
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (task != null)
+                    await task;
+            }
+            catch { }
+
+            lock (_sync)
+            {
+                _ws?.Dispose();
+                _ws = null;
+
+                _cts?.Dispose();
+                _cts = null;
+
+                _mainTask = null;
+            }
+        }
+
+        private async Task MainLoop(CancellationToken token)
         {
             int retry = 0;
 
-            while (!_cts.IsCancellationRequested)
+            while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    _ws?.Dispose();
-                    _ws = new ClientWebSocket();
-                    _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(10);
+                    lock (_sync)
+                    {
+                        _ws?.Dispose();
 
-                    await _ws.ConnectAsync(_uri, _cts.Token);
+                        _ws = new ClientWebSocket();
+                        _ws.Options.KeepAliveInterval =
+                            TimeSpan.FromSeconds(60);
+                    }
+
+                    await _ws.ConnectAsync(_uri, token);
                     Console.WriteLine("WebSocket接続成功");
 
-                    _ = Task.Run(PingLoop);
                     retry = 0;
 
-                    await ReceiveLoop();
+                    await ReceiveLoop(token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("接続エラー: " + ex.Message);
-                    System.Windows.Forms.MessageBox.Show("WebSocket接続に失敗しました。\n" + ex.Message, "エラー (WebSocket)", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
                 }
 
                 retry++;
@@ -57,33 +129,24 @@ namespace QuakeCityText
                 int delay = Math.Min(30000, retry * 2000);
                 Console.WriteLine($"再接続待機 {delay}ms");
 
-                await Task.Delay(delay, _cts.Token);
-            }
-        }
-
-        private async Task PingLoop()
-        {
-            while (_ws?.State == WebSocketState.Open && !_cts.Token.IsCancellationRequested)
-            {
                 try
                 {
-                    var buffer = Encoding.UTF8.GetBytes("ping");
-                    await _ws.SendAsync(
-                        new ArraySegment<byte>(buffer),
-                        WebSocketMessageType.Text,
-                        true,
-                        _cts.Token);
+                    await Task.Delay(delay, token);
                 }
-                catch { }
-
-                await Task.Delay(15000, _cts.Token);
+                catch
+                {
+                    break;
+                }
             }
         }
-        private async Task ReceiveLoop()
+
+        private async Task ReceiveLoop(CancellationToken token)
         {
             var buffer = new byte[8192];
 
-            while (_ws.State == WebSocketState.Open && !_cts.Token.IsCancellationRequested)
+            while (!token.IsCancellationRequested &&
+                   _ws != null &&
+                   _ws.State == WebSocketState.Open)
             {
                 try
                 {
@@ -94,11 +157,12 @@ namespace QuakeCityText
                     {
                         result = await _ws.ReceiveAsync(
                             new ArraySegment<byte>(buffer),
-                            _cts.Token);
+                            token);
 
-                        if (result.MessageType == WebSocketMessageType.Close)
+                        if (result.MessageType ==
+                            WebSocketMessageType.Close)
                         {
-                            Console.WriteLine("サーバが接続を終了");
+                            Console.WriteLine("サーバー切断");
                             return;
                         }
 
@@ -106,24 +170,10 @@ namespace QuakeCityText
 
                     } while (!result.EndOfMessage);
 
-                    string message = Encoding.UTF8.GetString(ms.ToArray());
+                    string message =
+                        Encoding.UTF8.GetString(ms.ToArray());
 
-                    try
-                    {
-                        var json = JObject.Parse(message);
-
-                        int code = json["code"]?.Value<int?>() ?? -1;
-                        if (code != 551)
-                        {
-                            continue;
-                        }
-                        OnMessageReceived?.Invoke(json);
-                    }
-                    catch
-                    {
-                        Console.WriteLine("JSONパース失敗");
-                        System.Windows.Forms.MessageBox.Show("受信したメッセージのJSONパースに失敗しました。\n" + message, "エラー (JSONパース)", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
-                    }
+                    ProcessMessage(message);
                 }
                 catch (OperationCanceledException)
                 {
@@ -131,36 +181,40 @@ namespace QuakeCityText
                 }
                 catch (WebSocketException ex)
                 {
-                    Console.WriteLine("WebSocket例外: " + ex.Message);
-                    System.Windows.Forms.MessageBox.Show("WebSocket通信中にエラーが発生しました。\n" + ex.Message, "エラー (WebSocket通信)", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+                    Console.WriteLine("通信切断: " + ex.Message);
                     return;
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine("受信エラー: " + ex.Message);
-                    System.Windows.Forms.MessageBox.Show("メッセージ受信中にエラーが発生しました。\n" + ex.Message, "エラー (受信)", System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
                     return;
                 }
             }
         }
 
-        public async Task StopAsync()
+        private void ProcessMessage(string message)
         {
-            _cts.Cancel();
-
             try
             {
-                if (_ws?.State == WebSocketState.Open)
-                {
-                    await _ws.CloseAsync(
-                        WebSocketCloseStatus.NormalClosure,
-                        "close",
-                        CancellationToken.None);
-                }
-            }
-            catch { }
+                var json = JObject.Parse(message);
 
-            _ws?.Dispose();
+                int code =
+                    json["code"]?.Value<int?>() ?? -1;
+
+                if (code != 551)
+                    return;
+
+                OnMessageReceived?.Invoke(json);
+            }
+            catch
+            {
+                Console.WriteLine("JSON解析失敗");
+            }
+        }
+
+        public void Dispose()
+        {
+            StopAsync().GetAwaiter().GetResult();
         }
     }
 }
